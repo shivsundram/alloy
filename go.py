@@ -205,31 +205,50 @@ def parseAST(tree):
     # topologically sort the augmented AST 
     return kernel_args, kernel_returns, node_dict
 
-  
+
+def add2(a, b):
+    c = 3*(2*a)+1*b
+    d = c*a
+    e = c+b
+    return d,e 
+
+
+def convertFuncFromTree(tree, kernel_name):
+
+    # seek to desired function node in AST (ie func we want to convert to native)
+    funcTree=getFuncFromTree(tree, kernel_name)
+
+    # get kernel arguments, returns, and concise compute dag from AST
+    kernel_args, kernel_returns, node_dict = parseAST(funcTree)
+
+    # topologically sort the compute dag to make a flattened compute schedule
+    pointOp = PointOp()       
+    schedule = pointOp.make_schedule(kernel_args,kernel_returns, node_dict)
+
+    # use flattened compute schedule and kernel args&return lists to make a native kernel string
+    kernel = pointOp.make_cuda_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
+    print("\n".join(kernel))
+
 
 def convertFuncFromFile(filename, kernel_name):
     with open(filename, "r") as source:
-        # parse AST
         tree = ast.parse(source.read())
+        convertFuncFromTree(tree, kernel_name)
+    
 
-        # seek to desired function node in AST (ie func we want to convert to native)
-        funcTree=getFuncFromTree(tree, kernel_name)
+def convertFunc(foo):
+    source = inspect.getsource(foo)
+    tree = ast.parse(source)
+    kernel_name = tree.body[0].name   
+    convertFuncFromTree(tree, kernel_name)
+   
 
-        # get kernel arguments, returns, and concise compute dag from AST
-        kernel_args, kernel_returns, node_dict = parseAST(funcTree)
-
-        # topologically sort the compute dag to make a flattened compute schedule
-        pointOp = PointOp()       
-        schedule = pointOp.make_schedule(kernel_args,kernel_returns, node_dict)
-
-        # use flattened compute schedule and kernel args&return lists to make a native kernel string
-        kernel = pointOp.make_cuda_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
-        print("\n".join(kernel))
 
 
 def main():
     import sys
     convertFuncFromFile("raw2.py", "add2")
+    convertFunc(add2)
     sys.exit(0)
 
 main()    
