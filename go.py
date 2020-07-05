@@ -1,22 +1,10 @@
 import astpretty
 import ast
- 
+import inspect 
+
 op_dict = {}
 op_dict[str(ast.Add)] = "+"
 op_dict[str(ast.Mult)] = "*"
-
-
-class FuncFinder(ast.NodeVisitor):
-    def __init__(self, node_name):
-        self.node_name=node_name
-        self.node=None
-
-    def visit_FunctionDef(self, node):
-        if(node.name == self.node_name):
-            self.node=node
-            print("i found "+ self.node_name)
-            #astpretty.pprint(node)
-            self.generic_visit(node)
 
 
 class Node():
@@ -51,7 +39,6 @@ class PointOp():
         arg_base = "float* "
         arg_string_list = ["const "+arg_base+arg for arg in args]
         arg_string_list.extend([arg_base+arg for arg in kernel_returns])
-        print(arg_string_list)
         arg_string_list.append("const int n") # add array len arg
         argstring = ", ".join(arg_string_list)
 
@@ -137,19 +124,29 @@ def make_c_prototype(kernel_name, args, kernel_returns, node_dict):
     return header
 
 
-"""
-#from https://stackoverflow.com/questions/40097590/detect-whether-a-python-string-is-a-number-or-a-letter
-def is_number(n):
-    try:
-        float(n)   # Type-casting the string to `float`.
-                   # If string is not a valid `float`, 
-                   # it'll raise `ValueError` exception
-    except ValueError:
-        return False
-    return True
-"""
 def make_c_body(schedule,args, kernel_returns, node_dict):
     pass
+
+def getFuncFromTree(tree, funcName):
+
+    class FuncFinder(ast.NodeVisitor):
+        def __init__(self, node_name):
+            self.node_name=node_name
+            self.node=None
+
+        def visit_FunctionDef(self, node):
+            if(node.name == self.node_name):
+                self.node=node
+                print("i found "+ self.node_name)
+                #astpretty.pprint(node)
+                self.generic_visit(node)
+
+    #start function
+    ff = FuncFinder(funcName)
+    ff.visit(tree)
+    funcTree=ff.node
+    return funcTree
+
 
 def parseBinOp(graph_node, node, node_dict):
     if isinstance(node.left, ast.BinOp):
@@ -180,104 +177,61 @@ def parseBinOp(graph_node, node, node_dict):
         elif isinstance(node.right, ast.Num):
             graph_node.right = node.right.n
  
-def convertAST(filename, kernel_name):
+
+def parseAST(tree):
+    #make list of each function argument's name
+    kernel_args = [arg1.id for arg1 in tree.args.args]
+    node_dict = {}
+    node_dict['tmpCnt'] = 0
+    kernel_returns = []
+
+    assigns = tree.body
+    # iterate over each lines/expression, launch recursive binary parser if necessary
+    for node in assigns:
+        if isinstance(node, ast.Assign):
+            graph_node = Node()
+            graph_node.name = node.targets[0].id
+            graph_node.op = node.value.op
+            if (isinstance(node.value, ast.BinOp)):
+                parseBinOp(graph_node,node.value, node_dict)
+            node_dict[node.targets[0].id] = graph_node
+        if isinstance(node, ast.Return):
+            if isinstance(node.value, ast.Name):
+                kernel_returns.append(node.value.id)
+            elif isinstance(node.value, ast.Tuple):
+                for return_val in node.value.elts:
+                    kernel_returns.append(return_val.id)
+    del node_dict['tmpCnt'] # undo dumb hack to make tmpCnt global scope
+    # topologically sort the augmented AST 
+    return kernel_args, kernel_returns, node_dict
+
+  
+
+def convertFuncFromFile(filename, kernel_name):
     with open(filename, "r") as source:
+        # parse AST
         tree = ast.parse(source.read())
-        print(tree.body)
-        print(tree.body[0].__dict__)
-        print(tree.body[0].args.__dict__)
-        kernel_args = []
-        for arg1 in tree.body[0].args.args:
-            print(arg1)
-            kernel_args.append(arg1.id)
-        ff = FuncFinder(kernel_name)
-        ff.visit(tree)
-        funcTree=ff.node
-        print(funcTree)
-        print(funcTree.__dict__)
-        assigns = funcTree.body
-        kernel_name = funcTree.name
-        node_dict = {}
-        node_dict['tmpCnt'] = 0
+
+        # seek to desired function node in AST (ie func we want to convert to native)
+        funcTree=getFuncFromTree(tree, kernel_name)
+
+        # get kernel arguments, returns, and concise compute dag from AST
+        kernel_args, kernel_returns, node_dict = parseAST(funcTree)
+
+        # topologically sort the compute dag to make a flattened compute schedule
         pointOp = PointOp()       
-        kernel_returns = []
-        # iterate over each lines/expression, launch recursive binary parser if necessary
-        for node in assigns:
-            if isinstance(node, ast.Assign):
-                graph_node = Node()
-                graph_node.name = node.targets[0].id
-                graph_node.op = node.value.op
-                if (isinstance(node.value, ast.BinOp)):
-                    parseBinOp(graph_node,node.value, node_dict)
-                node_dict[node.targets[0].id] = graph_node
-            if isinstance(node, ast.Return):
-                if isinstance(node.value, ast.Name):
-                    kernel_returns.append(node.value.id)
-                elif isinstance(node.value, ast.Tuple):
-                    for return_val in node.value.elts:
-                        kernel_returns.append(return_val.id)
-        del node_dict['tmpCnt'] # undo dumb hack to make tmpCnt global scope
-        #for key,value in node_dict.items():
-        #    print(key,value.__dict__)              
-        #print("args", kernel_args)
-        #print("returns", kernel_returns)
-
-        # topologically sort the augmented AST 
         schedule = pointOp.make_schedule(kernel_args,kernel_returns, node_dict)
-        print("schedule", schedule)
 
+        # use flattened compute schedule and kernel args&return lists to make a native kernel string
         kernel = pointOp.make_cuda_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
         print("\n".join(kernel))
+
 
 def main():
     import sys
-    convertAST("raw2.py", "add2")
+    convertFuncFromFile("raw2.py", "add2")
     sys.exit(0)
-    with open("raw2.py", "r") as source:
-        tree = ast.parse(source.read())
-        print(tree.body)
-        print(tree.body[0].__dict__)
-        print(tree.body[0].args.__dict__)
-        kernel_args = []
-        for arg1 in tree.body[0].args.args:
-            print(arg1)
-            kernel_args.append(arg1.id)
-        ff = FuncFinder('add2')
-        ff.visit(tree)
-        funcTree=ff.node
-        print(funcTree)
-        print(funcTree.__dict__)
-        assigns = funcTree.body
-        kernel_name = funcTree.name
-        node_dict = {}
-        node_dict['tmpCnt'] = 0
-        pointOp = PointOp()       
-        kernel_returns = []
-        # iterate over each lines/expression, launch recursive binary parser if necessary
-        for node in assigns:
-            if isinstance(node, ast.Assign):
-                graph_node = Node()
-                graph_node.name = node.targets[0].id
-                graph_node.op = node.value.op
-                if (isinstance(node.value, ast.BinOp)):
-                    parseBinOp(graph_node,node.value, node_dict)
-                node_dict[node.targets[0].id] = graph_node
-            if isinstance(node, ast.Return):
-                if isinstance(node.value, ast.Name):
-                    kernel_returns.append(node.value.id)
-                elif isinstance(node.value, ast.Tuple):
-                    for return_val in node.value.elts:
-                        kernel_returns.append(return_val.id)
-        del node_dict['tmpCnt'] # undo dumb hack to make tmpCnt global scope
-        #for key,value in node_dict.items():
-        #    print(key,value.__dict__)              
-        #print("args", kernel_args)
-        #print("returns", kernel_returns)
 
-        # topologically sort the augmented AST 
-        schedule = pointOp.make_schedule(kernel_args,kernel_returns, node_dict)
-        print("schedule", schedule)
-
-        kernel = pointOp.make_cuda_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
-        print("\n".join(kernel))
 main()    
+
+
