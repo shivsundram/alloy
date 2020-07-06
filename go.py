@@ -1,6 +1,10 @@
 import astpretty
+import array
+import ctypes
+import numpy as np
 import ast
 import inspect 
+import subprocess
 
 op_dict = {}
 op_dict[str(ast.Add)] = "+"
@@ -109,23 +113,68 @@ class PointOp():
         return stack  
 
 
+    def make_c_kernel(self, kernel_name, schedule, args, kernel_returns, node_dict):
 
-def make_c_prototype(kernel_name, args, kernel_returns, node_dict):    
-    header = "void " + kernel_name + "("
-
-    # add args to header
-    arg_base = "float* "
-    arg_string_list = ["const "+arg_base+arg for arg in args]
-    arg_string_list.extend([arg_base+arg for arg in kernel_returns])
-    arg_string_list.append("const int n") # add array len arg
-    argstring = ", ".join(arg_string_list)
-
-    header = header + argstring + ")"
-    return header
+        #make function prototype
+        header = self.make_c_prototype(kernel_name, args, kernel_returns, node_dict)
+        print(header)
+        # use schedule to make body of kernel, fusing all point ops
+        body = self.make_c_body(schedule,args, kernel_returns, node_dict)
+        # append header to body
+        kernel = [header]+body
+        return header, kernel
 
 
-def make_c_body(schedule,args, kernel_returns, node_dict):
-    pass
+    def make_c_prototype(self, kernel_name, args, kernel_returns, node_dict):    
+        header = "void " + kernel_name + "("
+
+        # add args to header
+        arg_base = "float* "
+        arg_string_list = [arg_base+arg for arg in args]
+        arg_string_list.extend([arg_base+arg for arg in kernel_returns])
+        arg_string_list.append("int n") # add array len arg
+        argstring = ", ".join(arg_string_list)
+    
+        header = header + argstring + ")"
+        print(header)
+        return header
+
+
+    def make_c_body(self, schedule,args, kernel_returns, node_dict):
+        body = []
+        body.append("{")
+        body.append("\tfor(int i =0; i<n; i++)")
+        body.append("\t{")
+
+        # make variable mappings for kernel fusion
+        fusion_map = {}
+        for arg in args+kernel_returns:
+            fusion_map[arg] = arg+"_i"
+        def fuse(elem):
+            return fusion_map[elem] if (elem in fusion_map) else elem
+        
+        # grap inputs
+        for arg in args:
+            body.append("\t\tconst float "+ arg+"_i = " + arg+"[i];")
+     
+        # do computations
+        for element in schedule:
+            node = node_dict[element]
+            registers = map(str, [element, node.left, node.right])
+            result, left, right = map(fuse, registers)
+            line = ["\t\tfloat", result, "=", left, op_dict[str(type(node.op))], right]
+            line = " ".join(line) +";"
+            body.append(line)
+        #body.append("{")
+        # commit results
+        for arg in kernel_returns:
+            body.append("\t\t"+ arg+"[i] = "+arg+"_i;")
+
+        body.append("\t}")
+        body.append("}")
+        print("\n".join(body))
+        return body
+
 
 def getFuncFromTree(tree, funcName):
 
@@ -148,6 +197,7 @@ def getFuncFromTree(tree, funcName):
     return funcTree
 
 
+# recursively parse binary expressions
 def parseBinOp(graph_node, node, node_dict):
     if isinstance(node.left, ast.BinOp):
         left_node = Node() 
@@ -206,13 +256,6 @@ def parseAST(tree):
     return kernel_args, kernel_returns, node_dict
 
 
-def add2(a, b):
-    c = 3*(2*a)+1*b
-    d = c*a
-    e = c+b
-    return d,e 
-
-
 def convertFuncFromTree(tree, kernel_name):
 
     # seek to desired function node in AST (ie func we want to convert to native)
@@ -227,30 +270,73 @@ def convertFuncFromTree(tree, kernel_name):
 
     # use flattened compute schedule and kernel args&return lists to make a native kernel string
     kernel = pointOp.make_cuda_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
+    header, kernel = pointOp.make_c_kernel(kernel_name, schedule, kernel_args,kernel_returns, node_dict)
     print("\n".join(kernel))
+    return header, kernel
 
+    
 
 def convertFuncFromFile(filename, kernel_name):
     with open(filename, "r") as source:
         tree = ast.parse(source.read())
         convertFuncFromTree(tree, kernel_name)
-    
 
+  
 def convertFunc(foo):
     source = inspect.getsource(foo)
     tree = ast.parse(source)
     kernel_name = tree.body[0].name   
-    convertFuncFromTree(tree, kernel_name)
-   
+    header, kernel = convertFuncFromTree(tree, kernel_name)
+    import os
+    with open(kernel_name+"GEN"+'.c', 'w') as fp: 
+        fp.write("\n".join(kernel))
+  
 
+def convertFunc2Native(foo):
+    source = inspect.getsource(foo)
+    tree = ast.parse(source)
+    kernel_name = tree.body[0].name   
+    header, kernel = convertFuncFromTree(tree, kernel_name)
+    import os
+    with open(kernel_name+"GEN"+'.c', 'w') as fp: 
+        fp.write("\n".join(kernel))
+  
+    name = kernel_name+"GEN"     
+    cmd = ["/usr/local/bin/gcc", "-O2", "-c", "-Wall", "-Werror", "-fpic", kernel_name+"GEN"+'.c']  
+    p = subprocess.call(cmd);  
+    print(name)
+    cmd = ["/usr/local/bin/gcc", "-shared", "-o", name+".so", name+".o"]
+    p = subprocess.call(cmd);  
+
+    ft = np.ctypeslib.ndpointer(dtype=np.float32)
+    mylib = ctypes.CDLL( name+".so")
+    mylib.add2.argtypes = [ft, ft, ft,ft, ctypes.c_int32]
+    return mylib.add2
+
+
+def add2(a, b):
+    c = 2*(2*a)+1*b
+    d = c*a
+    e = c+b
+    return d,e 
 
 
 def main():
-    import sys
-    convertFuncFromFile("raw2.py", "add2")
-    convertFunc(add2)
-    sys.exit(0)
+    #convertFuncFromFile("raw2.py", "add2")
+    a = np.array([1.0, 2., 3., 4., 5.], dtype='float32')
+    b = np.array([1., 2., 3., 4., 5.],dtype='float32')
+    d = np.array([0., 0., 0., 0., 0.],dtype='float32')
+    e = np.array([0., 0., 0., 0., 0.],dtype='float32')
 
+    d1 = np.array([0., 0., 0., 0., 0.],dtype='float32')
+    e1 = np.array([0., 0., 0., 0., 0.],dtype='float32')
+
+    add2Native = convertFunc2Native(add2) 
+    add2Native(a,b,d,e,5)
+
+    d1, e1 = add2(a,b)
+    print(d1)
+
+    print(d)
 main()    
-
 
